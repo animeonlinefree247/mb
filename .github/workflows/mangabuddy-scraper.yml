@@ -1,0 +1,81 @@
+name: MangaBuddy Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Modo de scraping"
+        required: true
+        default: "pages"
+        type: choice
+        options:
+          - pages
+          - url
+
+      pages:
+        description: "Páginas a scrapear (solo si modo=pages). Ej: 1  |  1-5  |  1,3,7  |  2-4,8"
+        required: false
+        default: "1"
+
+      url:
+        description: "URL de la serie (solo si modo=url). Ej: https://mangabuddy1.co.uk/series/..."
+        required: false
+        default: ""
+
+      page_size:
+        description: "URLs por página (default: 20)"
+        required: false
+        default: "20"
+
+jobs:
+  scrape:
+    name: Scrape MangaBuddy
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6h máx — ajusta según el volumen
+
+    steps:
+      # 1. Checkout del repo (incluye los sitemaps XML)
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # 2. Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. Dependencias
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Ejecutar el scraper
+      - name: Run scraper
+        env:
+          SCRAPE_MODE:  ${{ github.event.inputs.mode }}
+          SCRAPE_PAGES: ${{ github.event.inputs.pages }}
+          SCRAPE_URL:   ${{ github.event.inputs.url }}
+          PAGE_SIZE:    ${{ github.event.inputs.page_size }}
+          OUTPUT_DIR:   output
+        run: python mangabuddy_scraper_action.py
+
+      # 5. Subir los JSON como artifact descargable
+      - name: Upload output JSONs
+        if: always()   # sube aunque haya errores parciales
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangabuddy-output-${{ github.run_number }}
+          path: output/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # 6. (Opcional) Hacer commit de los JSON al repo
+      #    Descomenta este bloque si quieres persistir los resultados en el repo.
+      #
+      # - name: Commit output to repo
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add output/
+      #     git diff --cached --quiet || git commit -m "chore: scraped output run #${{ github.run_number }}"
+      #     git push
