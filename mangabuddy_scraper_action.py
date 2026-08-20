@@ -9,6 +9,7 @@ Inputs via variables de entorno (seteadas por el .yml):
   SCRAPE_URL     = "https://..."               (si SCRAPE_MODE=url)
   PAGE_SIZE      = "20"                        (opcional, default 20)
   OUTPUT_DIR     = "output"                    (opcional, default output)
+  SCRAPER_PROXY  = "http://user:pass@host:port" (opcional, proxy residencial)
 """
 
 import json
@@ -16,6 +17,7 @@ import os
 import re
 import sys
 import time
+import random
 import logging
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
@@ -32,25 +34,76 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Pool de User-Agents reales (Chrome, Firefox, Edge — Windows/Mac/Linux) ─────
+USER_AGENTS = [
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    # Chrome Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Firefox Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    # Firefox Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Edge Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    # Chrome Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.8,es;q=0.6",
+    "en-US,en;q=0.9,fr;q=0.7",
+]
+
 # ── Sesión HTTP ────────────────────────────────────────────────────────────────
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-})
 
-DELAY = 1.2
+# Proxy opcional (variable de entorno SCRAPER_PROXY)
+_proxy = os.environ.get("SCRAPER_PROXY", "").strip()
+if _proxy:
+    SESSION.proxies.update({"http": _proxy, "https": _proxy})
+    log.info(f"Proxy activo: {_proxy.split('@')[-1]}")  # oculta credenciales en log
+
+def _new_headers() -> dict:
+    """Genera un conjunto de headers realistas con UA y Accept-Language aleatorios."""
+    ua = random.choice(USER_AGENTS)
+    is_firefox = "Firefox" in ua
+    return {
+        "User-Agent": ua,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            if is_firefox else
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+        ),
+        "Accept-Language": random.choice(ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        **({"DNT": "1"} if random.random() > 0.5 else {}),
+    }
+
+# Delay base en segundos — el real será aleatorio entre DELAY_MIN y DELAY_MAX
+DELAY_MIN = 2.0
+DELAY_MAX = 5.0
+
+def _delay(extra: float = 0.0):
+    """Pausa aleatoria entre requests para no parecer un bot."""
+    t = random.uniform(DELAY_MIN, DELAY_MAX) + extra
+    time.sleep(t)
+
+# Mantener compatibilidad con el resto del código que usa DELAY directamente
+DELAY = DELAY_MIN
 
 # ── Config desde entorno ───────────────────────────────────────────────────────
 SCRAPE_MODE = os.environ.get("SCRAPE_MODE", "pages").lower()
@@ -120,10 +173,47 @@ def parse_pages_input(raw: str) -> list[int]:
 
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
+MAX_RETRIES = 4
+RETRY_BACKOFF = [10, 30, 60, 120]  # segundos de espera entre reintentos
+
 def get_soup(url: str) -> BeautifulSoup:
-    resp = SESSION.get(url, timeout=20)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    """
+    GET con rotación de headers + retry con backoff exponencial.
+    En cada intento usa un User-Agent distinto.
+    Si recibe 429 o 503 espera más antes de reintentar.
+    """
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            SESSION.headers.update(_new_headers())
+            resp = SESSION.get(url, timeout=25)
+
+            # Rate-limit explícito: esperar y reintentar
+            if resp.status_code in (429, 503):
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                log.warning(f"  [{resp.status_code}] Rate-limit en {url} — esperando {wait}s (intento {attempt+1}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return BeautifulSoup(resp.text, "html.parser")
+
+        except requests.HTTPError as e:
+            last_exc = e
+            if e.response is not None and e.response.status_code == 403:
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                log.warning(f"  [403] Bloqueado en {url} — esperando {wait}s (intento {attempt+1}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+            raise  # otros 4xx no se reintentan
+
+        except requests.RequestException as e:
+            last_exc = e
+            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+            log.warning(f"  [Error red] {e} — esperando {wait}s (intento {attempt+1}/{MAX_RETRIES})")
+            time.sleep(wait)
+
+    raise last_exc or RuntimeError(f"Falló tras {MAX_RETRIES} intentos: {url}")
 
 
 # ── Scraping de serie ──────────────────────────────────────────────────────────
@@ -192,7 +282,7 @@ def scrape_chapter_list(soup, base_url: str) -> list[dict]:
 
     latest_url = urljoin(base_url, latest_a.get("href", ""))
     log.info(f"  [→] Leyendo dropdown: {latest_url}")
-    time.sleep(DELAY)
+    _delay()
     latest_soup = get_soup(latest_url)
 
     buttons = latest_soup.select("[data-chapter-menu] button[data-chapter]")
@@ -270,7 +360,7 @@ def scrape_single_manga(manga_url: str) -> dict | None:
 
     try:
         manga_meta, soup = scrape_manga_meta(manga_url)
-        time.sleep(DELAY)
+        _delay()
         chapters_meta = scrape_chapter_list(soup, manga_url)
 
         if not chapters_meta:
@@ -293,7 +383,7 @@ def scrape_single_manga(manga_url: str) -> dict | None:
         total = len(chapters_meta)
         for i, ch in enumerate(chapters_meta, 1):
             log.info(f"  [{i}/{total}] {ch['name']}")
-            time.sleep(DELAY)
+            _delay()
             try:
                 images = scrape_chapter_images(ch["url"])
             except Exception as e:
